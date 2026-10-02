@@ -1,0 +1,94 @@
+{
+  "name": "Météo-Dressing — gestion des erreurs",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "8c5d3a3b-e66c-47f7-83af-bb866769e416",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Mise en forme de l'erreur technique (nœud planté, credential invalide, BDD HS...)\nconst ex = $json.execution || {};\nreturn { json: {\n  workflow: ($json.workflow || {}).name || 'inconnu',\n  node: ex.lastNodeExecuted || null,\n  message: (ex.error && ex.error.message) || 'Erreur inconnue',\n  execution_id: ex.id ? String(ex.id) : null,\n  execution_url: ex.url || null,\n  mode: ex.mode || null,\n  stack: ex.error && ex.error.stack ? String(ex.error.stack).slice(0, 2000) : null,\n} };"
+      },
+      "id": "893bb0df-7ce5-4c8d-8cfe-ad34296e2651",
+      "name": "Formater l'erreur",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "insert into pipeline_errors (workflow, node, message, execution_id, execution_url, payload)\nselect p->>'workflow', p->>'node', p->>'message', p->>'execution_id', p->>'execution_url', p\nfrom (select $1::jsonb as p) t returning id;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify($json) }}"
+        }
+      },
+      "id": "c871df83-9b1e-4c58-a417-f0b4612d1151",
+      "name": "Journaliser dans pipeline_errors",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        448,
+        0
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500,
+      "credentials": {
+        "postgres": {
+          "id": "DEQMY1kXFjEh0BNk",
+          "name": "Postgres account 3"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Formater l'erreur",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Formater l'erreur": {
+      "main": [
+        [
+          {
+            "node": "Journaliser dans pipeline_errors",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "1ec0b0ac-41f0-44df-b14e-08b7cc3fecb3",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "644cb2fadaf799142cabedc804be74ca15a60aa2cb7fb443c746a73e415e7dbe"
+  },
+  "nodeGroups": [],
+  "id": "hoaUCfGKPc1qHdCk",
+  "tags": []
+}

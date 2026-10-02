@@ -1,0 +1,7 @@
+# Environnement et secrets
+.env
+credentials/
+
+# Fichiers OS
+.DS_Store
+Thumbs.db

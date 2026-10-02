@@ -1,0 +1,1075 @@
+{
+  "name": "Météo-Dressing — tenue du jour IA",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## 👗 Météo-Dressing — pipeline principal\n**Déclencheurs** : tous les jours à 7h (tous les utilisateurs) **ou** à la demande (POST /webhook/outfit).\n\nSupabase (profil + garde-robe + historique) → Open-Meteo (géocodage + prévisions) → filtrage météo/anti-répétition → **LLM NVIDIA NIM** → validation (8 contrôles) → Supabase → réponse.",
+        "height": 200,
+        "width": 1060,
+        "color": 4
+      },
+      "id": "51b4b89d-d1a8-409b-be99-cafae79a8c75",
+      "name": "Note 0",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 🤖 Étape IA\nPrompt système + prompt utilisateur envoyés à `integrate.api.nvidia.com`.\nRetry x3. Si l'API tombe ou répond n'importe quoi → algorithme de secours (le pipeline ne plante jamais).",
+        "width": 520,
+        "color": 5
+      },
+      "id": "d9058c6c-4c1d-4627-9de2-b66bcfbe05b7",
+      "name": "Note 1",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1632,
+        112
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 🖥️ Mini-appli web + feedback\nOuvrir **GET /webhook/dressing** dans le navigateur.\nLes étoiles appellent /outfit-feedback (note 1-5 = évaluation humaine + apprentissage).",
+        "height": 140,
+        "width": 620,
+        "color": 6
+      },
+      "id": "c06563d2-312d-4c46-81aa-82a60f33283c",
+      "name": "Note 2",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        752
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 7 * * *"
+            }
+          ]
+        }
+      },
+      "id": "fe36035d-d116-481f-8f73-1cd6e3d6fd27",
+      "name": "Chaque jour à 7h",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        32,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "select id as user_id from app_users where active and id <> 99 order by id;",
+        "options": {}
+      },
+      "id": "27bfddae-8e7a-463c-93b3-70575aac6c31",
+      "name": "Utilisateurs actifs",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        256,
+        240
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500,
+      "credentials": {
+        "postgres": {
+          "id": "DEQMY1kXFjEh0BNk",
+          "name": "Postgres account 3"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "outfit",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "b3871ff3-7995-4e5a-9a84-26754d8827fe",
+      "name": "Webhook tenue (POST /outfit)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        32,
+        448
+      ],
+      "webhookId": "7d9105d2-c5b7-4b3e-8861-8d7433f6c2a7"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ============================================================\n// Nœud : \"Normaliser la requête\"   (Mode : Run Once for Each Item)\n// Reçoit soit une ligne utilisateur (Schedule), soit un appel Webhook.\n// Produit une requête propre et validée pour la suite du pipeline.\n// ============================================================\nconst STYLES = ['casual', 'chic', 'sport', 'business', 'streetwear', 'boheme'];\nconst OCCASIONS = ['quotidien', 'travail', 'sortie', 'sport', 'rendez-vous', 'week-end', 'voyage'];\nconst SIMULATIONS = {\n  pluie_froide: { tmin: 4, tmax: 9, feels_min: 1, feels_max: 6, precip_prob: 90, precip_mm: 8, wind_kmh: 30, uv: 1, code: 63 },\n  canicule:     { tmin: 24, tmax: 36, feels_min: 25, feels_max: 38, precip_prob: 0, precip_mm: 0, wind_kmh: 8, uv: 9, code: 0 },\n  neige:        { tmin: -5, tmax: 1, feels_min: -10, feels_max: -2, precip_prob: 80, precip_mm: 4, wind_kmh: 20, uv: 1, code: 73 },\n  vent_fort:    { tmin: 12, tmax: 17, feels_min: 8, feels_max: 14, precip_prob: 20, precip_mm: 0, wind_kmh: 55, uv: 3, code: 3 },\n  printemps:    { tmin: 11, tmax: 20, feels_min: 10, feels_max: 20, precip_prob: 10, precip_mm: 0, wind_kmh: 12, uv: 5, code: 1 },\n};\n\nconst isWebhook = $json.headers !== undefined && $json.body !== undefined;\nlet b = isWebhook ? $json.body : $json;\nif (typeof b === 'string') { try { b = JSON.parse(b); } catch (e) { b = {}; } }\nb = b || {};\n\nconst warnings = [];\nconst clean = (v) => (typeof v === 'string' && v.trim() ? v.trim().toLowerCase() : null);\n\nfunction parisDate(offsetDays) {\n  const d = new Date(Date.now() + offsetDays * 86400000);\n  return d.toLocaleDateString('sv-SE', { timeZone: 'Europe/Paris' }); // => YYYY-MM-DD\n}\n\nlet style = clean(b.style);\nif (style && !STYLES.includes(style)) {\n  warnings.push(`Style inconnu « ${b.style} » : le style du profil est utilisé.`);\n  style = null;\n}\nlet occasion = clean(b.occasion);\nif (occasion && !OCCASIONS.includes(occasion)) {\n  warnings.push(`Occasion inconnue « ${b.occasion} » : l'occasion par défaut est utilisée.`);\n  occasion = null;\n}\n\nconst dayOffset = [0, 1].includes(Number(b.day_offset)) ? Number(b.day_offset) : 0;\n\nlet source = 'schedule';\nif (isWebhook) source = ['eval', 'eval_dry'].includes(b.source) ? b.source : 'webhook';\n\n// Mode simulation : météo forcée (démo live ou jeu de test d'évaluation)\nlet weatherOverride = null;\nif (b.weather_override && typeof b.weather_override === 'object') weatherOverride = b.weather_override;\nelse if (typeof b.simulate === 'string' && SIMULATIONS[b.simulate]) weatherOverride = { ...SIMULATIONS[b.simulate], label: b.simulate };\n// Une simulation lancée depuis l'appli ne doit pas polluer l'historique réel\nif (weatherOverride && source === 'webhook') {\n  source = 'eval_dry';\n  warnings.push('Mode simulation : cette tenue n’est pas enregistrée dans ton historique.');\n}\n\nconst validDate = typeof b.outfit_date === 'string' && /^\\d{4}-\\d{2}-\\d{2}$/.test(b.outfit_date);\nconst outfitDate = validDate && source.startsWith('eval') ? b.outfit_date : parisDate(dayOffset);\n\nreturn {\n  json: {\n    source,\n    user_id: parseInt(b.user_id ?? 1, 10) || 1,\n    city: typeof b.city === 'string' && b.city.trim() ? b.city.trim().slice(0, 80) : null,\n    style,\n    occasion,\n    day_offset: dayOffset,\n    outfit_date: outfitDate,\n    format: b.format === 'json' ? 'json' : 'html',\n    model: typeof b.model === 'string' && b.model.includes('/') ? b.model : null,\n    weather_override: weatherOverride,\n    base_url: isWebhook && $json.webhookUrl ? String($json.webhookUrl).replace(/[^/]*$/, '') : '',\n    warnings,\n  },\n};\n"
+      },
+      "id": "e8eefe21-8858-4946-9410-ec3c070425bb",
+      "name": "Normaliser la requête",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        352
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "select $1::jsonb as req,\n       get_outfit_context(($1::jsonb->>'user_id')::int, ($1::jsonb->>'outfit_date')::date) as ctx;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify($json) }}"
+        }
+      },
+      "id": "e45caa8f-5eef-438c-85bf-7e4ecbe6dde4",
+      "name": "Charger profil & garde-robe",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        688,
+        352
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500,
+      "credentials": {
+        "postgres": {
+          "id": "DEQMY1kXFjEh0BNk",
+          "name": "Postgres account 3"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "https://geocoding-api.open-meteo.com/v1/search",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "name",
+              "value": "={{ $json.req.city || ($json.ctx && $json.ctx.user ? $json.ctx.user.city : 'Paris') }}"
+            },
+            {
+              "name": "count",
+              "value": "1"
+            },
+            {
+              "name": "language",
+              "value": "fr"
+            },
+            {
+              "name": "format",
+              "value": "json"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "ee886882-a145-4e90-abaf-d8f1d032f1f3",
+      "name": "Géocoder la ville (Open-Meteo)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        912,
+        352
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ============================================================\n// Nœud : \"Résoudre la localisation\"   (Mode : Run Once for Each Item)\n// Combine le contexte BDD + le résultat du géocodage Open-Meteo.\n// Si la ville est introuvable -> repli sur la ville du profil (pas de crash).\n// ============================================================\nconst base = $('Charger profil & garde-robe').item.json; // { req, ctx }\nconst geo = $json || {};\nconst req = base.req;\nconst ctx = base.ctx;\nconst warnings = [...(req.warnings || [])];\n\nif (!ctx || !ctx.user) {\n  return { json: { req, ctx: null, warnings, fatal: `Utilisateur n°${req.user_id} introuvable.` } };\n}\nif (!Array.isArray(ctx.wardrobe) || ctx.wardrobe.length === 0) {\n  return { json: { req, ctx, warnings, fatal: 'Ta garde-robe est vide (ou tout est au linge sale) : ajoute des pièces disponibles.' } };\n}\n\nconst r = Array.isArray(geo.results) && geo.results.length ? geo.results[0] : null;\nlet location;\nif (r) {\n  location = { name: r.name, country: r.country || null, lat: r.latitude, lon: r.longitude, source: 'geocoding' };\n} else {\n  if (req.city) warnings.push(`Ville « ${req.city} » introuvable : ${ctx.user.city} est utilisée.`);\n  if (geo.error) warnings.push('Service de géocodage indisponible : coordonnées du profil utilisées.');\n  location = { name: ctx.user.city, country: null, lat: ctx.user.latitude, lon: ctx.user.longitude, source: 'profil' };\n}\n\nreturn { json: { req, ctx, location, warnings, fatal: null } };\n"
+      },
+      "id": "a7d811fb-8fc8-424f-a3d6-4f439f179106",
+      "name": "Résoudre la localisation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1136,
+        352
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://api.open-meteo.com/v1/forecast",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "latitude",
+              "value": "={{ $json.location ? $json.location.lat : 48.8566 }}"
+            },
+            {
+              "name": "longitude",
+              "value": "={{ $json.location ? $json.location.lon : 2.3522 }}"
+            },
+            {
+              "name": "daily",
+              "value": "weather_code,temperature_2m_max,temperature_2m_min,apparent_temperature_max,apparent_temperature_min,precipitation_sum,precipitation_probability_max,wind_speed_10m_max,uv_index_max"
+            },
+            {
+              "name": "hourly",
+              "value": "apparent_temperature"
+            },
+            {
+              "name": "timezone",
+              "value": "auto"
+            },
+            {
+              "name": "forecast_days",
+              "value": "3"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "86120fb2-c998-4903-b425-5170c10ca05b",
+      "name": "Prévisions météo (Open-Meteo)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1360,
+        352
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ============================================================\n// Nœud : \"Analyser la météo\"   (Mode : Run Once for Each Item)\n// Transforme la réponse Open-Meteo en \"features\" exploitables :\n// ressenti effectif (ajusté à la frilosité), bande thermique,\n// pluie / neige / vent / UV, écart matin-soir, contraintes de tenue.\n// ============================================================\nconst base = $('Résoudre la localisation').item.json; // { req, ctx, location, warnings }\nconst api = $json || {};\nconst { req, ctx, location } = base;\nconst warnings = [...(base.warnings || [])];\nif (base.fatal) return { json: base }; // erreur déjà détectée en amont : on la transmet\n\nconst WMO = {\n  0: 'Ciel dégagé', 1: 'Plutôt ensoleillé', 2: 'Partiellement nuageux', 3: 'Couvert',\n  45: 'Brouillard', 48: 'Brouillard givrant', 51: 'Bruine légère', 53: 'Bruine', 55: 'Bruine dense',\n  56: 'Bruine verglaçante', 57: 'Bruine verglaçante', 61: 'Pluie faible', 63: 'Pluie modérée',\n  65: 'Pluie forte', 66: 'Pluie verglaçante', 67: 'Pluie verglaçante forte', 71: 'Neige faible',\n  73: 'Neige modérée', 75: 'Neige forte', 77: 'Grains de neige', 80: 'Averses faibles',\n  81: 'Averses', 82: 'Averses violentes', 85: 'Averses de neige', 86: 'Fortes averses de neige',\n  95: 'Orage', 96: 'Orage avec grêle', 99: 'Orage violent avec grêle',\n};\nconst round1 = (x) => Math.round(x * 10) / 10;\n\nlet w; // météo brute du jour cible\nif (req.weather_override) {\n  const o = req.weather_override;\n  const fmin = o.feels_min ?? o.tmin, fmax = o.feels_max ?? o.tmax;\n  w = {\n    tmin: o.tmin, tmax: o.tmax, feels_min: fmin, feels_max: fmax,\n    precip_prob: o.precip_prob ?? 0, precip_mm: o.precip_mm ?? 0,\n    wind_kmh: o.wind_kmh ?? 10, uv: o.uv ?? 3, code: o.code ?? 2,\n    morning: o.morning ?? fmin + (fmax - fmin) * 0.2,\n    afternoon: o.afternoon ?? fmax,\n    evening: o.evening ?? fmin + (fmax - fmin) * 0.5,\n    simulated: true, simulation_label: o.label || 'scénario de test',\n  };\n} else {\n  if (!api.daily || !Array.isArray(api.daily.time)) {\n    return { json: { ...base, warnings, fatal: 'Service météo indisponible pour le moment, réessaie dans quelques minutes.' } };\n  }\n  const d = api.daily;\n  let i = d.time.indexOf(req.outfit_date);\n  if (i < 0) { i = 0; warnings.push('Date hors prévisions : météo du jour utilisée.'); }\n  const hourAt = (h, field) => {\n    if (!api.hourly || !api.hourly.time) return null;\n    const k = api.hourly.time.indexOf(`${d.time[i]}T${String(h).padStart(2, '0')}:00`);\n    return k >= 0 ? api.hourly[field][k] : null;\n  };\n  w = {\n    tmin: d.temperature_2m_min[i], tmax: d.temperature_2m_max[i],\n    feels_min: d.apparent_temperature_min[i], feels_max: d.apparent_temperature_max[i],\n    precip_prob: d.precipitation_probability_max?.[i] ?? 0,\n    precip_mm: d.precipitation_sum?.[i] ?? 0,\n    wind_kmh: d.wind_speed_10m_max?.[i] ?? 0,\n    uv: d.uv_index_max?.[i] ?? 0,\n    code: d.weather_code[i],\n    morning: hourAt(8, 'apparent_temperature'),\n    afternoon: hourAt(14, 'apparent_temperature'),\n    evening: hourAt(19, 'apparent_temperature'),\n    simulated: false,\n  };\n  if (w.morning === null) w.morning = w.feels_min;\n  if (w.afternoon === null) w.afternoon = w.feels_max;\n  if (w.evening === null) w.evening = (w.feels_min + w.feels_max) / 2;\n}\n\n// --- Features -------------------------------------------------------------\nconst ADJ = { frileux: -3, normal: 0, chaud: 2 };\nconst adj = ADJ[ctx.user.cold_sensitivity] ?? 0;\n// ressenti \"journée\" pondéré : on est surtout dehors le matin et l'après-midi\nconst feelsDay = 0.4 * w.morning + 0.4 * w.afternoon + 0.2 * w.evening;\nconst effective = round1(feelsDay + adj);\n\nlet band;\nif (effective < 5) band = 'very_cold';\nelse if (effective < 11) band = 'cold';\nelse if (effective < 16) band = 'cool';\nelse if (effective < 21) band = 'mild';\nelse if (effective < 26) band = 'warm';\nelse band = 'hot';\n\nconst code = Number(w.code);\nconst snow = [71, 73, 75, 77, 85, 86].includes(code);\nconst storm = code >= 95;\nconst rain = !snow && (w.precip_prob >= 50 || w.precip_mm >= 1 || (code >= 51 && code <= 67) || (code >= 80 && code <= 82) || storm);\nconst heavyRain = rain && (w.precip_mm >= 5 || [65, 67, 82].includes(code) || storm);\nconst windy = w.wind_kmh >= 35;\nconst uvHigh = w.uv >= 6;\nconst sunny = code <= 1;\nconst swing = round1(Math.max(w.morning, w.afternoon, w.evening) - Math.min(w.morning, w.afternoon, w.evening));\n\n// Plage cible de chaleur cumulée (haut + couche intermédiaire + manteau)\nconst TARGET = { very_cold: [9, 14], cold: [6, 11], cool: [4, 8], mild: [2, 5], warm: [1, 3], hot: [0, 2] };\nconst BOTTOM = { very_cold: [2, 5], cold: [2, 5], cool: [1, 5], mild: [1, 4], warm: [0, 2], hot: [0, 1] };\nconst bandIdx = ['very_cold', 'cold', 'cool', 'mild', 'warm', 'hot'].indexOf(band);\n\nconst requirements = {\n  layer_warmth_target: TARGET[band],\n  bottom_warmth_range: BOTTOM[band],\n  mid_layer_required: bandIdx <= 1,\n  outerwear_required: bandIdx <= 2 || snow || (windy && bandIdx <= 3),\n  rain_protection_required: rain || snow,\n  waterproof_shoes_preferred: heavyRain || snow,\n  layering_advised: swing >= 8,\n};\n\nconst BAND_FR = { very_cold: 'très froid', cold: 'froid', cool: 'frais', mild: 'doux', warm: 'chaud', hot: 'très chaud' };\nconst flags = [];\nif (rain) flags.push(heavyRain ? 'fortes pluies' : 'pluie probable');\nif (snow) flags.push('neige');\nif (storm) flags.push('orage');\nif (windy) flags.push('vent fort');\nif (uvHigh) flags.push('UV élevés');\nif (requirements.layering_advised) flags.push(`écart de ${swing}°C dans la journée`);\n\nconst weather = {\n  date: req.outfit_date,\n  city: location.name,\n  description: WMO[code] || 'Conditions variables',\n  code,\n  tmin: round1(w.tmin), tmax: round1(w.tmax),\n  feels_min: round1(w.feels_min), feels_max: round1(w.feels_max),\n  feels_morning: round1(w.morning), feels_afternoon: round1(w.afternoon), feels_evening: round1(w.evening),\n  effective_feel: effective,\n  cold_adjustment: adj,\n  precip_prob: w.precip_prob, precip_mm: round1(w.precip_mm),\n  wind_kmh: round1(w.wind_kmh), uv: round1(w.uv),\n  rain, heavy_rain: heavyRain, snow, storm, windy, uv_high: uvHigh, sunny, swing,\n  band, band_fr: BAND_FR[band], flags,\n  simulated: !!w.simulated, simulation_label: w.simulation_label || null,\n  requirements,\n  summary: `${WMO[code] || 'Temps variable'}, ${round1(w.tmin)}→${round1(w.tmax)}°C `\n    + `(ressenti ${round1(w.morning)}°C le matin, ${round1(w.afternoon)}°C l'après-midi, ${round1(w.evening)}°C le soir), `\n    + `pluie ${w.precip_prob}% (${round1(w.precip_mm)} mm), vent ${round1(w.wind_kmh)} km/h, UV ${round1(w.uv)}.`,\n};\n\nreturn { json: { req, ctx, location, weather, warnings, fatal: null } };\n"
+      },
+      "id": "37d58f20-1151-4838-a807-bc5dc3340afb",
+      "name": "Analyser la météo",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1568,
+        352
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "342efc2f-b805-48e2-a50e-a0d7f2bf0e9e",
+              "leftValue": "={{ !$json.fatal }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "fa694f3a-9d60-4228-9f9b-8bdcb4da753d",
+      "name": "Contexte valide ?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1808,
+        352
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ============================================================\n// Nœud : \"Pré-filtrer & construire le prompt\"   (Mode : Run Once for Each Item)\n// 1) Filtres durs : météo (chaleur, pluie), anti-répétition (cooldown),\n//    pièces déjà proposées aujourd'hui.\n// 2) Score de pertinence : style, formalité, rotation, notes utilisateur.\n// 3) On garde le top N par catégorie -> prompt court, LLM \"ancré\" (pas d'invention).\n// ============================================================\nconst MODEL_DEFAULT = 'openai/gpt-4o-mini'; // modèle gratuit build.nvidia.com\n\nconst { req, ctx, location, weather } = $json;\nconst warnings = [...($json.warnings || [])];\nconst user = ctx.user;\nconst STYLE = req.style || user.preferred_style;\nconst OCCASION = req.occasion || user.default_occasion;\nconst band = weather.band;\nconst R = weather.requirements;\nconst BANDS = ['very_cold', 'cold', 'cool', 'mild', 'warm', 'hot'];\nconst bi = BANDS.indexOf(band);\n\nconst OCC_FORMALITY = { quotidien: 2, travail: 4, sortie: 3, sport: 1, 'rendez-vous': 3.5, 'week-end': 2, voyage: 2 };\nconst targetFormality = OCC_FORMALITY[OCCASION] ?? 2;\nconst COOLDOWN = { base_top: 4, bottom: 2, mid_layer: 2, outerwear: 0, shoes: 0, accessory: 0 }; // en jours\nconst KEEP = { base_top: 6, mid_layer: 5, bottom: 6, outerwear: 5, shoes: 5, accessory: 8 };\nconst IDEAL = { // chaleur idéale par catégorie selon la bande\n  base_top:  { very_cold: 3, cold: 2, cool: 2, mild: 1, warm: 1, hot: 0 },\n  mid_layer: { very_cold: 4, cold: 3, cool: 2, mild: 1, warm: 1, hot: 0 },\n  outerwear: { very_cold: 5, cold: 4, cool: 2, mild: 1, warm: 1, hot: 0 },\n  shoes:     { very_cold: 3, cold: 3, cool: 2, mild: 1, warm: 1, hot: 0 },\n};\nconst proposedToday = new Set(ctx.already_proposed_today || []);\n\n// ---------- Filtres durs ----------------------------------------------------\nfunction hardReject(it, useCooldown) {\n  const c = it.category, wv = it.warmth, sub = it.subcategory;\n  if (['base_top', 'bottom', 'mid_layer'].includes(c) && proposedToday.has(it.id)) return 'déjà proposé aujourd’hui';\n  if (useCooldown && it.days_since_worn !== null && it.days_since_worn < COOLDOWN[c]) return 'porté trop récemment';\n  if (c === 'base_top' && ((band === 'hot' && wv >= 3) || (bi <= 1 && wv === 0))) return 'chaleur inadaptée';\n  if (c === 'mid_layer' && bi >= 4 && wv >= 3) return 'trop chaud';\n  if (c === 'bottom' && (wv < R.bottom_warmth_range[0] || wv > R.bottom_warmth_range[1])) return 'chaleur inadaptée';\n  if (c === 'outerwear') {\n    if (band === 'hot' && wv >= 2) return 'trop chaud';\n    if (band === 'warm' && wv >= 4) return 'trop chaud';\n    if (band === 'mild' && wv >= 4 && !weather.snow) return 'trop chaud';\n    if (band === 'cool' && wv >= 5 && !weather.snow) return 'trop chaud';\n    if (band === 'very_cold' && wv < 3) return 'pas assez chaud';\n    if (band === 'cold' && wv < 2) return 'pas assez chaud';\n  }\n  if (c === 'shoes') {\n    if ((bi <= 2 || weather.rain || weather.snow) && wv === 0) return 'chaussures ouvertes inadaptées';\n    if (band === 'hot' && wv >= 3 && !weather.rain) return 'trop chaud';\n    if (weather.snow && !it.waterproof) return 'pas imperméable (neige)';\n  }\n  if (c === 'accessory') {\n    if (['bonnet', 'gants'].includes(sub) && bi >= 3) return 'inutile par cette chaleur';\n    if (sub === 'echarpe' && bi >= 4) return 'inutile par cette chaleur';\n    if (sub === 'chapeau' && (weather.rain || bi <= 2)) return 'inadapté';\n  }\n  return null;\n}\n\n// ---------- Score de pertinence -------------------------------------------\nfunction accessoryRelevance(it) {\n  const s = it.subcategory;\n  if (s === 'parapluie') return R.rain_protection_required ? 6 : -3;\n  if (s === 'lunettes_soleil') return (weather.uv_high || (weather.sunny && bi >= 3)) ? 4 : -1;\n  if (s === 'casquette' || s === 'chapeau') return weather.uv_high && bi >= 3 ? 3 : -1;\n  if (s === 'bonnet' || s === 'gants') return bi === 0 ? 4 : bi === 1 ? 1 : -2;\n  if (s === 'echarpe') return bi <= 1 ? 3 : (bi === 2 || weather.windy) ? 1 : -2;\n  return 0; // ceinture, montre, sac, foulard : neutres\n}\n\nfunction score(it) {\n  let s = 0;\n  const styles = it.styles || [];\n  if (styles.includes(STYLE)) s += 4;\n  else if (styles.includes('casual')) s += 1;\n  else s -= 2;\n  if (OCCASION === 'sport' && styles.includes('sport')) s += 3;\n  s -= 1.2 * Math.abs(it.formality - targetFormality);\n  // rotation : on favorise ce qui n'a pas été porté depuis longtemps\n  if (it.days_since_worn === null) s += 1.5;\n  else s += Math.min(it.days_since_worn, 14) * 0.15;\n  s -= 0.8 * (it.wear_count_14d || 0);\n  // apprentissage à partir des notes de l'utilisateur\n  if (it.avg_rating !== null && it.avg_rating !== undefined) s += (Number(it.avg_rating) - 3) * 1.2;\n  if (IDEAL[it.category]) s -= 0.7 * Math.abs(it.warmth - IDEAL[it.category][band]);\n  if (R.rain_protection_required && it.waterproof && ['outerwear', 'shoes'].includes(it.category)) s += 3;\n  if (it.category === 'accessory') s += accessoryRelevance(it);\n  return Math.round(s * 100) / 100;\n}\n\n// ---------- Sélection des candidats ---------------------------------------\nconst CATS = ['base_top', 'mid_layer', 'bottom', 'outerwear', 'shoes', 'accessory'];\nconst candidates = {};\nconst excludedStats = {};\nfor (const cat of CATS) {\n  const pool = ctx.wardrobe.filter((it) => it.category === cat);\n  let kept = pool.filter((it) => {\n    const why = hardReject(it, true);\n    if (why) excludedStats[why] = (excludedStats[why] || 0) + 1;\n    return !why;\n  });\n  if (kept.length === 0 && pool.length > 0 && ['base_top', 'bottom', 'shoes'].includes(cat)) {\n    kept = pool.filter((it) => !hardReject(it, false));\n    if (kept.length === 0) kept = pool; // dernier recours : on garde tout plutôt que d'échouer\n    warnings.push(`Peu de choix en « ${cat} » : l'anti-répétition a été assouplie.`);\n  }\n  candidates[cat] = kept\n    .map((it) => ({ ...it, score: score(it) }))\n    .sort((a, b) => b.score - a.score)\n    .slice(0, KEEP[cat]);\n}\nif (R.mid_layer_required && candidates.mid_layer.length === 0) R.mid_layer_required = false;\nif (R.outerwear_required && candidates.outerwear.length === 0) R.outerwear_required = false;\n\n// ---------- Historique pour l'anti-répétition -------------------------------\nconst nameById = Object.fromEntries(ctx.wardrobe.map((it) => [it.id, it.name]));\nconst recent = (ctx.recent_outfits || []).slice(0, 7);\nconst historyLines = recent.length\n  ? recent.map((o) => `- ${o.date} : ${(o.item_ids || []).map((id) => nameById[id] || `#${id}`).join(', ')}`\n      + ` (haut+bas ${o.combo_key})${o.rating ? ` — note ${o.rating}/5` : ''}`).join('\\n')\n  : '- (aucune tenue récente)';\nconst forbiddenCombos = [...new Set((ctx.recent_outfits || []).map((o) => o.combo_key).filter(Boolean))];\n\nconst fmt = (it) => {\n  const worn = it.days_since_worn === null ? 'jamais porté récemment' : `porté il y a ${it.days_since_worn} j`;\n  return `  #${it.id} ${it.name} | ${it.color} | chaleur ${it.warmth}${it.waterproof ? ' | imperméable' : ''}`\n    + ` | styles ${it.styles.join('/')} | formalité ${it.formality} | ${worn}`;\n};\nconst catBlock = (cat, label) => `${label}:\\n${candidates[cat].length ? candidates[cat].map(fmt).join('\\n') : '  (aucune pièce)'}`;\n\n// ---------- Prompts ---------------------------------------------------------\nconst systemPrompt = `Tu es « Météo-Dressing », un styliste personnel expert, pragmatique et bienveillant.\nTa mission : composer LA tenue du jour à partir d'une garde-robe réelle, selon la météo, le style et l'occasion.\n\nRÈGLES STRICTES\n1. Choisis UNIQUEMENT des pièces de la liste fournie, désignées par leur numéro (id). N'invente jamais de pièce.\n2. Catégories : base_top (1 obligatoire), bottom (1 obligatoire), shoes (1 obligatoire), mid_layer (0 ou 1, obligatoire si indiqué), outerwear (0 ou 1, obligatoire si indiqué), accessories (0 à 3).\n3. Confort thermique : la somme des chaleurs base_top + mid_layer + outerwear doit rester dans la plage cible indiquée.\n4. Pluie ou neige : prévois une protection (outerwear imperméable ou parapluie).\n5. Anti-répétition : ne reprends jamais une combinaison haut+bas de l'historique ; privilégie les pièces peu portées récemment.\n6. Harmonie : 3 couleurs dominantes maximum dont au moins une neutre ; respecte le style et la formalité de l'occasion.\n7. Écris en français, en tutoyant, avec un ton chaleureux et concret.\n\nFORMAT DE SORTIE\nRéponds UNIQUEMENT avec un objet JSON valide, sans texte autour et sans balises Markdown :\n{\n  \"outfit\": {\"base_top\": <id>, \"mid_layer\": <id ou null>, \"bottom\": <id>, \"outerwear\": <id ou null>, \"shoes\": <id>, \"accessories\": [<id>, ...]},\n  \"title\": \"<nom court et accrocheur de la tenue, 6 mots maximum>\",\n  \"advice\": \"<conseil personnalisé de 40 à 80 mots qui justifie les choix par la météo et le style>\",\n  \"tips\": [\"<astuce pratique courte>\", \"<astuce pratique courte>\"],\n  \"palette\": [\"<couleur>\", \"<couleur>\", \"<couleur>\"]\n}`;\n\nconst T = R.layer_warmth_target;\nconst userPrompt = `CONTEXTE DU JOUR\n- Date : ${weather.date} — ${weather.city}${weather.simulated ? ' (météo simulée)' : ''}\n- Météo : ${weather.summary}\n- Ressenti retenu : ${weather.effective_feel}°C => temps ${weather.band_fr}${weather.flags.length ? ' ; ' + weather.flags.join(', ') : ''}\n\nPROFIL\n- Prénom : ${user.name} | style souhaité : ${STYLE} | occasion : ${OCCASION} | sensibilité au froid : ${user.cold_sensitivity}\n\nCONTRAINTES\n- Plage cible de chaleur (base_top + mid_layer + outerwear) : entre ${T[0]} et ${T[1]}\n- mid_layer : ${R.mid_layer_required ? 'OBLIGATOIRE' : 'optionnel'} | outerwear : ${R.outerwear_required ? 'OBLIGATOIRE' : 'optionnel'}\n- Protection pluie/neige : ${R.rain_protection_required ? 'OBLIGATOIRE' : 'non nécessaire'}${R.layering_advised ? '\\n- Grand écart de température : privilégie des couches faciles à retirer' : ''}\n- Combinaisons haut+bas interdites (format idHaut-idBas) : ${forbiddenCombos.length ? forbiddenCombos.join(', ') : 'aucune'}\n\nHISTORIQUE RÉCENT (à ne pas répéter)\n${historyLines}\n\nPIÈCES DISPONIBLES (déjà filtrées pour la météo)\n${catBlock('base_top', 'base_top')}\n${catBlock('mid_layer', 'mid_layer')}\n${catBlock('bottom', 'bottom')}\n${catBlock('outerwear', 'outerwear')}\n${catBlock('shoes', 'shoes')}\n${catBlock('accessory', 'accessories')}\n\nCompose la tenue et réponds avec le JSON demandé.`;\n\nconst model = req.model || MODEL_DEFAULT;\nreturn {\n  json: {\n    req, ctx: { user, recent_outfits: ctx.recent_outfits, already_proposed_today: ctx.already_proposed_today },\n    location, weather, warnings,\n    style: STYLE, occasion: OCCASION,\n    candidates, forbidden_combos: forbiddenCombos, excluded_stats: excludedStats,\n    t0: Date.now(),\n    llm_request: {\n      model,\n      messages: [\n        { role: 'system', content: systemPrompt },\n        { role: 'user', content: userPrompt },\n      ],\n      temperature: 0.5,\n      top_p: 0.9,\n      max_tokens: 800,\n      stream: false,\n      response_format: { type: 'json_object' },\n    },\n  },\n};\n"
+      },
+      "id": "d7daf5a7-cf0c-4274-86fd-c4c6807bdd72",
+      "name": "Pré-filtrer & construire le prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2016,
+        288
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ============================================================\n// Nœud : \"Valider & évaluer la tenue\"   (Mode : Run Once for Each Item)\n// - Parse la réponse du LLM (tolère ```json, <think>, texte parasite)\n// - 8 contrôles automatiques = évaluation de CHAQUE sortie du LLM\n// - Réparation légère (parapluie oublié) ou repli déterministe si la sortie\n//   est inutilisable : le pipeline ne plante jamais.\n// ============================================================\nconst base = $('Pré-filtrer & construire le prompt').item.json;\nconst resp = $json || {};\nconst { req, weather, candidates, style: STYLE } = base;\nconst R = weather.requirements;\nconst warnings = [...(base.warnings || [])];\nconst latency = Date.now() - (base.t0 || Date.now());\n\n// ---------- 1. Parsing robuste ---------------------------------------------\nlet raw = '';\nlet apiError = null;\nlet body = resp;\nif (typeof body.data === 'string') { try { body = JSON.parse(body.data); } catch (e) { raw = body.data; } }\nif (resp.error) apiError = typeof resp.error === 'string' ? resp.error : (resp.error.message || JSON.stringify(resp.error));\nelse if (!raw) {\n  const content = body?.choices?.[0]?.message?.content;\n  raw = Array.isArray(content) ? content.map((c) => c.text || '').join('') : (content ?? '');\n  if (!raw && body?.choices === undefined) apiError = 'Réponse inattendue du fournisseur LLM : ' + JSON.stringify(body).slice(0, 300);\n}\n\nfunction parseLLM(text) {\n  if (!text || typeof text !== 'string') return null;\n  let t = text.replace(/<think>[\\s\\S]*?<\\/think>/gi, '').replace(/```(?:json)?/gi, '').trim();\n  const start = t.indexOf('{'), end = t.lastIndexOf('}');\n  if (start < 0 || end <= start) return null;\n  try { return JSON.parse(t.slice(start, end + 1)); } catch (e) { return null; }\n}\nconst parsed = parseLLM(raw);\n\n// ---------- 2. Contrôles ---------------------------------------------------\nconst byCat = {};\nfor (const [cat, list] of Object.entries(candidates)) byCat[cat] = new Map(list.map((it) => [it.id, it]));\n// accepte 10, \"10\", \"#10\", \"#10 Chemise…\", {\"id\":10,...}\nconst toId = (v) => {\n  if (v === null || v === undefined || v === '' || v === 'null') return null;\n  if (typeof v === 'object') return toId(v.id ?? v.item_id ?? v.ID ?? null);\n  const m = String(v).match(/\\d+/);\n  return m ? parseInt(m[0], 10) : null;\n};\nconst anyCategoryOf = (id) => {\n  for (const [cat, map] of Object.entries(byCat)) if (map.has(id)) return cat;\n  return null;\n};\nconst repairs = [];\nfunction normalizeOutfit(o) {\n  o = o || {};\n  const acc = o.accessories ?? o.accessory ?? [];\n  const out = {\n    base_top: toId(o.base_top ?? o.top), mid_layer: toId(o.mid_layer), bottom: toId(o.bottom),\n    outerwear: toId(o.outerwear), shoes: toId(o.shoes),\n    accessories: (Array.isArray(acc) ? acc : [acc]).map(toId).filter((x) => x !== null),\n  };\n  // pièce existante mais rangée dans la mauvaise catégorie -> on la remet à sa place\n  for (const cat of ['base_top', 'mid_layer', 'bottom', 'outerwear', 'shoes']) {\n    const id = out[cat];\n    if (id === null || byCat[cat]?.has(id)) continue;\n    const real = anyCategoryOf(id);\n    if (real && real !== 'accessory' && out[real] === null) { out[real] = id; out[cat] = null; repairs.push(`catégorie corrigée pour #${id}`); }\n    else if (real === 'accessory') { out.accessories.push(id); out[cat] = null; }\n  }\n  return out;\n}\nconst itemOf = (cat, id) => (id === null ? null : byCat[cat === 'accessories' ? 'accessory' : cat]?.get(id) || null);\nconst comboKey = (o) => `${o.base_top}-${o.bottom}`;\nconst layerWarmth = (o) => ['base_top', 'mid_layer', 'outerwear']\n  .reduce((s, c) => s + (itemOf(c, o[c])?.warmth || 0), 0);\n\nfunction runChecks(o, text) {\n  const c = {};\n  c.json_valid = !!parsed;\n  const singles = ['base_top', 'mid_layer', 'bottom', 'outerwear', 'shoes'];\n  c.ids_valid = singles.every((cat) => o[cat] === null || !!itemOf(cat, o[cat]))\n    && o.accessories.every((id) => !!itemOf('accessories', id));\n  c.required_present = !!(o.base_top && o.bottom && o.shoes\n    && (!R.mid_layer_required || o.mid_layer) && (!R.outerwear_required || o.outerwear));\n  const lw = layerWarmth(o);\n  c.thermal_ok = lw >= R.layer_warmth_target[0] && lw <= R.layer_warmth_target[1];\n  const outer = itemOf('outerwear', o.outerwear);\n  const hasUmbrella = o.accessories.some((id) => itemOf('accessories', id)?.subcategory === 'parapluie');\n  c.rain_ok = !R.rain_protection_required || (outer && outer.waterproof) || hasUmbrella;\n  const core = [itemOf('base_top', o.base_top), itemOf('bottom', o.bottom), itemOf('shoes', o.shoes),\n    itemOf('outerwear', o.outerwear) || itemOf('mid_layer', o.mid_layer)].filter(Boolean);\n  c.style_ok = core.filter((it) => (it.styles || []).includes(STYLE)).length >= 2;\n  c.no_repeat = !base.forbidden_combos.includes(comboKey(o));\n  const words = (text || '').trim().split(/\\s+/).filter(Boolean).length;\n  c.advice_ok = words >= 25 && words <= 120;\n  return c;\n}\n\nlet outfit = normalizeOutfit(parsed?.outfit);\nconst llmChecks = runChecks(outfit, parsed?.advice);\nconst passed = Object.values(llmChecks).filter(Boolean).length;\nconst ruleScore = Math.round((passed / Object.keys(llmChecks).length) * 1000) / 1000;\n\n// ---------- 3. Repli déterministe si la sortie est inutilisable -----------\nfunction bestDeterministic() {\n  const top = (cat, n) => (candidates[cat] || []).slice(0, n);\n  const opt = (cat, required, n) => (required ? top(cat, n) : [null, ...top(cat, n)]);\n  let best = null;\n  for (const t of top('base_top', 3)) for (const b of top('bottom', 3))\n  for (const m of opt('mid_layer', R.mid_layer_required, 3))\n  for (const ow of opt('outerwear', R.outerwear_required, 3)) for (const s of top('shoes', 2)) {\n    const o = { base_top: t.id, bottom: b.id, mid_layer: m ? m.id : null, outerwear: ow ? ow.id : null, shoes: s.id, accessories: [] };\n    const lw = (t.warmth) + (m ? m.warmth : 0) + (ow ? ow.warmth : 0);\n    let sc = t.score + b.score + s.score;\n    // couches : on ajoute leur score si obligatoires, sinon on préfère la sobriété\n    for (const [layer, req] of [[m, R.mid_layer_required], [ow, R.outerwear_required]]) {\n      if (!layer) continue;\n      if (req) sc += layer.score;\n      else sc += (R.rain_protection_required && layer.waterproof) ? 2 : -1.5;\n    }\n    if (lw < R.layer_warmth_target[0] || lw > R.layer_warmth_target[1]) sc -= 20;\n    sc -= 0.5 * Math.abs(lw - (R.layer_warmth_target[0] + R.layer_warmth_target[1]) / 2);\n    if (base.forbidden_combos.includes(comboKey(o))) sc -= 15;\n    if (R.rain_protection_required && !(ow && ow.waterproof)) sc -= 2; // parapluie ajouté ensuite\n    if (!best || sc > best.sc) best = { o, sc };\n  }\n  const o = best ? best.o : { base_top: null, bottom: null, mid_layer: null, outerwear: null, shoes: null, accessories: [] };\n  o.accessories = (candidates.accessory || []).filter((a) => a.score > 3).slice(0, 2).map((a) => a.id);\n  return o;\n}\n\nlet mode = 'llm';\nlet title = typeof parsed?.title === 'string' ? parsed.title.slice(0, 80) : null;\nlet advice = typeof parsed?.advice === 'string' ? parsed.advice : null;\nlet tips = Array.isArray(parsed?.tips) ? parsed.tips.filter((t) => typeof t === 'string').slice(0, 4) : [];\nlet palette = Array.isArray(parsed?.palette) ? parsed.palette.filter((t) => typeof t === 'string').slice(0, 4) : [];\n\n// Réparations ciblées plutôt que tout jeter\nconst failed = Object.entries(llmChecks).filter(([, ok]) => !ok).map(([k]) => k);\nif (parsed) {\n  for (const cat of ['base_top', 'mid_layer', 'bottom', 'outerwear', 'shoes']) {\n    if (outfit[cat] !== null && !itemOf(cat, outfit[cat])) { repairs.push(`pièce inconnue #${outfit[cat]} retirée`); outfit[cat] = null; }\n  }\n  const badAcc = outfit.accessories.filter((id) => !itemOf('accessories', id));\n  if (badAcc.length) repairs.push(`accessoire(s) inconnu(s) retiré(s)`);\n  outfit.accessories = [...new Set(outfit.accessories.filter((id) => itemOf('accessories', id)))];\n  if (outfit.accessories.length > 3) { outfit.accessories = outfit.accessories.slice(0, 3); repairs.push('accessoires limités à 3'); }\n  const need = { base_top: true, bottom: true, shoes: true, mid_layer: R.mid_layer_required, outerwear: R.outerwear_required };\n  const chosenCount = ['base_top', 'bottom', 'shoes'].filter((c) => outfit[c] !== null).length;\n  if (chosenCount >= 2) {  // le LLM a proposé une vraie tenue : on complète ce qui manque\n    for (const [cat, required] of Object.entries(need)) {\n      if (required && outfit[cat] === null && (candidates[cat] || []).length) {\n        outfit[cat] = candidates[cat][0].id;\n        repairs.push(`${cat} manquant ajouté (${candidates[cat][0].name})`);\n      }\n    }\n  }\n}\nconst usable = parsed && outfit.base_top !== null && outfit.bottom !== null && outfit.shoes !== null\n  && (!R.mid_layer_required || outfit.mid_layer !== null) && (!R.outerwear_required || outfit.outerwear !== null);\n\nif (!usable) {\n  mode = 'fallback';\n  outfit = bestDeterministic();\n  if (apiError) warnings.push('Le modèle IA est indisponible : tenue proposée par l’algorithme de secours.');\n  else warnings.push(`Réponse IA invalide (${failed.join(', ') || 'format'}) : tenue proposée par l’algorithme de secours.`);\n  title = 'La sélection du jour';\n  const names = ['base_top', 'mid_layer', 'bottom', 'outerwear', 'shoes']\n    .map((c) => itemOf(c, outfit[c])?.name).filter(Boolean);\n  advice = `Avec ${weather.description.toLowerCase()} et un ressenti de ${weather.effective_feel}°C à ${weather.city}, `\n    + `je te propose : ${names.join(', ')}. Cette combinaison respecte ton style ${STYLE}, `\n    + `évite tes tenues des derniers jours et reste adaptée à la température de la journée.`;\n  tips = [];\n  palette = [];\n}\n\n// ---------- 4. Réparations légères (tracées) ------------------------------\nconst finalOuter = itemOf('outerwear', outfit.outerwear);\nconst umbrella = (candidates.accessory || []).find((a) => a.subcategory === 'parapluie');\nif (R.rain_protection_required && !(finalOuter && finalOuter.waterproof)\n    && !outfit.accessories.some((id) => itemOf('accessories', id)?.subcategory === 'parapluie') && umbrella) {\n  outfit.accessories = [...outfit.accessories.slice(0, 2), umbrella.id];\n  repairs.push('parapluie ajouté');\n}\n// Anti-répétition GARANTIE : si la combinaison haut+bas a déjà été portée\n// récemment, on remplace le bas (puis le haut) par le meilleur candidat libre.\nif (base.forbidden_combos.includes(comboKey(outfit))) {\n  const fixed = (() => {\n    for (const b of candidates.bottom || []) {\n      const o = { ...outfit, bottom: b.id };\n      if (!base.forbidden_combos.includes(comboKey(o))) return { o, what: `bas remplacé par ${b.name}` };\n    }\n    for (const t of candidates.base_top || []) {\n      const o = { ...outfit, base_top: t.id };\n      if (!base.forbidden_combos.includes(comboKey(o))) return { o, what: `haut remplacé par ${t.name}` };\n    }\n    return null;\n  })();\n  if (fixed) { outfit = fixed.o; repairs.push(`combinaison déjà portée : ${fixed.what}`); warnings.push(`Ajustement anti-répétition : ${fixed.what}.`); }\n}\nif (weather.uv_high && !tips.some((t) => /crème|solaire|spf/i.test(t))) tips.push('UV élevés : pense à la crème solaire.');\nif (R.layering_advised && !tips.some((t) => /couche|retirer|enlever/i.test(t))) {\n  tips.push(`Écart de ${weather.swing}°C aujourd’hui : garde une couche facile à retirer.`);\n}\n\n// ---------- 5. Construction du résultat -----------------------------------\nconst finalItems = [];\nfor (const cat of ['base_top', 'mid_layer', 'bottom', 'outerwear', 'shoes']) {\n  const it = itemOf(cat, outfit[cat]);\n  if (it) finalItems.push({ category: cat, id: it.id, name: it.name, subcategory: it.subcategory, color: it.color, warmth: it.warmth, waterproof: it.waterproof, styles: it.styles });\n}\nfor (const id of outfit.accessories) {\n  const it = itemOf('accessories', id);\n  if (it) finalItems.push({ category: 'accessory', id: it.id, name: it.name, subcategory: it.subcategory, color: it.color, warmth: it.warmth, waterproof: it.waterproof, styles: it.styles });\n}\nconst finalChecks = runChecks(outfit, advice);\n\nconst savePayload = {\n  user_id: req.user_id,\n  outfit_date: req.outfit_date,\n  source: req.source,\n  style: STYLE,\n  occasion: base.occasion,\n  city: weather.city,\n  weather,\n  weather_band: weather.band,\n  items: outfit,\n  item_ids: finalItems.map((i) => i.id),\n  combo_key: comboKey(outfit),\n  title, advice,\n  tips: { tips, palette, repairs, warnings, final_checks: finalChecks },\n  generation_mode: mode,\n  model: base.llm_request.model,\n  llm_raw: (raw || apiError || '').slice(0, 4000),\n  latency_ms: latency,\n  checks: llmChecks,\n  rule_score: ruleScore,\n};\n\nreturn {\n  json: {\n    req, weather, warnings,\n    style: STYLE, occasion: base.occasion,\n    outfit, items: finalItems, title, advice, tips, palette, repairs,\n    generation_mode: mode, checks: llmChecks, final_checks: finalChecks, rule_score: ruleScore,\n    latency_ms: latency, model: base.llm_request.model,\n    save_payload: savePayload,\n  },\n};"
+      },
+      "id": "0f604a9b-e065-48ef-b588-bda8b924088c",
+      "name": "Valider & évaluer la tenue",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2464,
+        288
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "select save_outfit($1::jsonb) as saved;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify($json.save_payload) }}"
+        }
+      },
+      "id": "3fc0081e-965c-4d27-932a-50aefb80888a",
+      "name": "Enregistrer la tenue",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2688,
+        288
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500,
+      "credentials": {
+        "postgres": {
+          "id": "DEQMY1kXFjEh0BNk",
+          "name": "Postgres account 3"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ============================================================\n// Nœud : \"Construire la réponse\"   (Mode : Run Once for Each Item)\n// Page HTML de la tenue (ou JSON si format=json, utilisé par l'évaluation).\n// ============================================================\nconst v = $('Valider & évaluer la tenue').item.json;\nconst saved = $json.saved || {};\nconst outfitId = saved.outfit_id || null;\nconst { req, weather } = v;\n\nif (req.format === 'json') {\n  const body = {\n    outfit_id: outfitId, outfit_date: req.outfit_date, source: req.source,\n    style: v.style, occasion: v.occasion, title: v.title, advice: v.advice, tips: v.tips, palette: v.palette,\n    items: v.items, weather, generation_mode: v.generation_mode, model: v.model,\n    checks: v.checks, final_checks: v.final_checks, rule_score: v.rule_score,\n    repairs: v.repairs, latency_ms: v.latency_ms, warnings: v.warnings,\n  };\n  return { json: { source: req.source, content_type: 'application/json; charset=utf-8', status_code: 200, response_body: JSON.stringify(body) } };\n}\n\nconst esc = (s) => String(s ?? '').replace(/[&<>\"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', \"'\": '&#39;' }[c]));\nconst EMOJI = { base_top: '👕', mid_layer: '🧶', bottom: '👖', outerwear: '🧥', shoes: '👟', accessory: '🎒' };\nconst LABEL = { base_top: 'Haut', mid_layer: 'Couche', bottom: 'Bas', outerwear: 'Veste / manteau', shoes: 'Chaussures', accessory: 'Accessoire' };\nconst WX = (w) => (w.snow ? '❄️' : w.storm ? '⛈️' : w.rain ? '🌧️' : w.code <= 1 ? '☀️' : w.code <= 3 ? '⛅' : '🌫️');\nconst COLORS = { blanc: '#f5f5f5', noir: '#1f1f1f', gris: '#9ca3af', beige: '#d6c3a0', camel: '#c19a6b', marron: '#7b4a2e',\n  'bleu marine': '#1e2a4a', marine: '#1e2a4a', bleu: '#3b6fd8', 'bleu ciel': '#9cc8ef', 'bleu jean': '#4a6c9b', 'bleu brut': '#243b62',\n  'bleu clair': '#9fb9d6', kaki: '#6b6b3a', vert: '#3f8f5a', 'vert olive': '#708238', rouge: '#c0392b', bordeaux: '#6d1a2b',\n  jaune: '#f2c500', orange: '#e67e22', écru: '#efe8d8', crème: '#f3ead3', rose: '#e8a0b4', argent: '#c0c0c0' };\nconst swatch = (c) => COLORS[String(c).toLowerCase().trim()] || '#cbd5e1';\nconst base = req.base_url || '';\n\nconst itemsHtml = v.items.map((it) => `\n  <div class=\"item\">\n    <div class=\"emo\">${EMOJI[it.category] || '•'}</div>\n    <div class=\"txt\"><small>${LABEL[it.category]}</small><b>${esc(it.name)}</b></div>\n    <span class=\"dot\" style=\"background:${swatch(it.color)}\" title=\"${esc(it.color)}\"></span>\n    ${outfitId && !req.source.startsWith('eval') ? `<button class=\"mini\" title=\"Mettre au linge sale\" onclick=\"laundry(${it.id}, this)\">🧺</button>` : ''}\n  </div>`).join('');\n\nconst checkNames = { json_valid: 'JSON valide', ids_valid: 'Pièces existantes', required_present: 'Tenue complète',\n  thermal_ok: 'Confort thermique', rain_ok: 'Protection pluie', style_ok: 'Style respecté', no_repeat: 'Pas de répétition', advice_ok: 'Conseil clair' };\nconst checksHtml = Object.entries(v.checks).map(([k, ok]) => `<span class=\"chk ${ok ? 'ok' : 'ko'}\">${ok ? '✓' : '✗'} ${checkNames[k] || k}</span>`).join('');\nconst stars = outfitId && !req.source.startsWith('eval')\n  ? [1, 2, 3, 4, 5].map((n) => `<a class=\"star\" href=\"${base}outfit-feedback?id=${outfitId}&r=${n}\">★<small>${n}</small></a>`).join('')\n  : '<i>Simulation : notation désactivée</i>';\n\nconst html = `<!doctype html><html lang=\"fr\"><head><meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>${esc(v.title)} · Météo-Dressing</title>\n<style>\n:root{--bg:#f6f4ef;--card:#fff;--ink:#1d1b16;--mut:#6b675e;--acc:#2f5d50;--ok:#1f7a4d;--ko:#b3261e}\n*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--ink)}\n.wrap{max-width:760px;margin:0 auto;padding:24px 16px 48px}\n.hero{background:linear-gradient(135deg,#2f5d50,#4f8a74);color:#fff;border-radius:20px;padding:22px 24px}\n.hero h1{margin:6px 0 4px;font-size:1.7rem}.hero p{margin:0;opacity:.9}\n.wx{display:flex;gap:14px;flex-wrap:wrap;margin-top:14px}.wx div{background:rgba(255,255,255,.15);padding:8px 12px;border-radius:12px;font-size:.9rem}\n.card{background:var(--card);border-radius:18px;padding:20px;margin-top:16px;box-shadow:0 1px 3px rgba(0,0,0,.06)}\n.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px}\n.item{display:flex;align-items:center;gap:10px;border:1px solid #eee;border-radius:14px;padding:10px 12px}\n.emo{font-size:1.6rem}.txt{flex:1;display:flex;flex-direction:column}.txt small{color:var(--mut);font-size:.75rem}\n.dot{width:16px;height:16px;border-radius:50%;border:1px solid #ccc}.mini{border:0;background:#f1efe9;border-radius:8px;cursor:pointer;padding:4px 6px}\n.advice{font-size:1.05rem;line-height:1.55}.tips li{margin:4px 0}\n.pal{display:flex;gap:8px;margin-top:8px}.pal span{display:flex;align-items:center;gap:6px;font-size:.85rem;color:var(--mut)}\n.pal i{width:22px;height:22px;border-radius:6px;border:1px solid #ddd;display:inline-block}\n.chk{display:inline-block;font-size:.78rem;padding:4px 8px;border-radius:999px;margin:3px 4px 0 0}\n.chk.ok{background:#e3f4ea;color:var(--ok)}.chk.ko{background:#fbe5e3;color:var(--ko)}\n.warn{background:#fff6dc;border:1px solid #f0d98a;border-radius:12px;padding:10px 14px;margin-top:12px;font-size:.9rem}\n.stars{display:flex;gap:8px}.star{display:flex;flex-direction:column;align-items:center;text-decoration:none;color:#e0a100;font-size:1.6rem;background:#fff8e1;border-radius:12px;padding:6px 12px}\n.star small{font-size:.7rem;color:var(--mut)}.meta{color:var(--mut);font-size:.8rem;margin-top:10px}\na.back{color:var(--acc)}\n</style></head><body><div class=\"wrap\">\n<div class=\"hero\">\n  <small>${esc(weather.date)} · ${esc(weather.city)} · style ${esc(v.style)} · ${esc(v.occasion)}</small>\n  <h1>${WX(weather)} ${esc(v.title)}</h1>\n  <p>${esc(weather.description)} — ressenti ${weather.effective_feel}°C (temps ${esc(weather.band_fr)})${weather.simulated ? ' · <b>simulation</b>' : ''}</p>\n  <div class=\"wx\"><div>🌡️ ${weather.tmin}° → ${weather.tmax}°</div><div>🌅 ${weather.feels_morning}° · ☀️ ${weather.feels_afternoon}° · 🌙 ${weather.feels_evening}°</div>\n  <div>☔ ${weather.precip_prob}% · ${weather.precip_mm} mm</div><div>💨 ${weather.wind_kmh} km/h</div><div>🔆 UV ${weather.uv}</div></div>\n</div>\n${v.warnings.length ? `<div class=\"warn\">${v.warnings.map(esc).join('<br>')}</div>` : ''}\n<div class=\"card\"><div class=\"grid\">${itemsHtml}</div></div>\n<div class=\"card\"><div class=\"advice\">${esc(v.advice)}</div>\n${v.tips.length ? `<ul class=\"tips\">${v.tips.map((t) => `<li>${esc(t)}</li>`).join('')}</ul>` : ''}\n${v.palette.length ? `<div class=\"pal\">${v.palette.map((c) => `<span><i style=\"background:${swatch(c)}\"></i>${esc(c)}</span>`).join('')}</div>` : ''}\n</div>\n<div class=\"card\"><b>Cette tenue te plaît ?</b><p style=\"margin:6px 0 10px;color:var(--mut);font-size:.9rem\">Ta note ajuste les prochaines suggestions.</p><div class=\"stars\">${stars}</div></div>\n<div class=\"card\"><b>Contrôle qualité automatique : ${Math.round(v.rule_score * 100)}%</b><div>${checksHtml}</div>\n<div class=\"meta\">Généré par ${v.generation_mode === 'llm' ? esc(v.model) : 'algorithme de secours'} en ${v.latency_ms} ms${v.repairs.length ? ' · corrections : ' + esc(v.repairs.join(', ')) : ''}${outfitId ? ' · tenue n°' + outfitId : ''}</div></div>\n<p><a class=\"back\" href=\"${base}dressing?user_id=${req.user_id}\">← Retour au dressing</a></p>\n</div>\n<script>\nasync function laundry(id, btn){btn.disabled=true;\n  try{const r=await fetch('${base}wardrobe-status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({item_id:id,status:'laundry'})});\n  btn.textContent=r.ok?'✓':'!';}catch(e){btn.textContent='!';}}\n</script></body></html>`;\n\nreturn { json: { source: req.source, content_type: 'text/html; charset=utf-8', status_code: 200, response_body: html } };\n"
+      },
+      "id": "f55cd8f4-28f8-4de0-ac87-137c004d4a67",
+      "name": "Construire la réponse",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2896,
+        288
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ============================================================\n// Nœud : \"Construire la réponse d'erreur\"   (Mode : Run Once for Each Item)\n// Erreur \"métier\" (utilisateur inconnu, garde-robe vide, météo HS...) :\n// on répond proprement au lieu de laisser le webhook sans réponse.\n// ============================================================\nconst req = $json.req || {};\nconst msg = $json.fatal || 'Erreur inconnue';\nconst esc = (s) => String(s ?? '').replace(/[&<>\"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', \"'\": '&#39;' }[c]));\n\nif (req.format === 'json') {\n  return { json: { source: req.source || 'webhook', content_type: 'application/json; charset=utf-8', status_code: 422,\n    response_body: JSON.stringify({ error: msg, warnings: $json.warnings || [] }) } };\n}\nconst html = `<!doctype html><html lang=\"fr\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>Oups · Météo-Dressing</title><style>body{font-family:system-ui,sans-serif;background:#f6f4ef;display:grid;place-items:center;min-height:100vh;margin:0}\n.c{background:#fff;padding:28px;border-radius:18px;max-width:460px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,.08)}a{color:#2f5d50}</style></head>\n<body><div class=\"c\"><div style=\"font-size:2.4rem\">🧥❓</div><h2>Impossible de générer la tenue</h2><p>${esc(msg)}</p>\n<p><a href=\"${esc(req.base_url || '')}dressing\">← Retour au dressing</a></p></div></body></html>`;\nreturn { json: { source: req.source || 'webhook', content_type: 'text/html; charset=utf-8', status_code: 422, response_body: html } };\n"
+      },
+      "id": "a501588b-e364-4cfc-87b7-6f74351340b4",
+      "name": "Construire la réponse d'erreur",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2016,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cf7e8550-0522-492a-9f4e-fc36645331d2",
+              "leftValue": "={{ $json.source !== 'schedule' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "8372b39f-d2db-466b-b8bd-d286ec320b95",
+      "name": "Déclenché par webhook ?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3120,
+        352
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.response_body }}",
+        "options": {
+          "responseCode": "={{ $json.status_code || 200 }}",
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "={{ $json.content_type }}"
+              },
+              {
+                "name": "Cache-Control",
+                "value": "no-store"
+              }
+            ]
+          }
+        }
+      },
+      "id": "e2932a75-d796-46e4-9947-7e884aaf19b9",
+      "name": "Répondre",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        3344,
+        320
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "74c6fe7b-0066-4f03-ad91-dce2ea481cf9",
+      "name": "Fin (run planifié)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        3344,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "path": "dressing",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "52f83907-efc5-4593-b1dc-f5b8c5dfa51f",
+      "name": "Page appli (GET /dressing)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        32,
+        960
+      ],
+      "webhookId": "13732426-41c7-4941-b3dd-83eb6c7d9b37"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "select $1::jsonb as q, app_page_data(($1::jsonb->>'user_id')::int) as data;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ user_id: parseInt($json.query.user_id) || 1, base_url: String($json.webhookUrl || '').replace(/[^/]*$/, '') }) }}"
+        }
+      },
+      "id": "883b64de-c493-40d2-8c9c-051efca11e90",
+      "name": "Données de l'appli",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        256,
+        960
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500,
+      "credentials": {
+        "postgres": {
+          "id": "DEQMY1kXFjEh0BNk",
+          "name": "Postgres account 3"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ============================================================\n// Nœud : \"Construire la page de l'appli\"   (Mode : Run Once for Each Item)\n// Mini-interface web servie directement par n8n (GET /webhook/dressing) :\n// formulaire (style, occasion, ville, demain, simulation), historique,\n// indicateurs d'évaluation en direct et linge sale.\n// ============================================================\nconst q = $json.q || {};\nconst d = $json.data || {};\nconst base = q.base_url || '';\nconst users = d.users || [];\nconst me = users.find((u) => u.id === q.user_id) || users[0] || { id: 1, name: '?', city: 'Paris', style: 'casual' };\nconst S = d.summary || {};\nconst esc = (s) => String(s ?? '').replace(/[&<>\"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', \"'\": '&#39;' }[c]));\nconst opt = (vals, sel) => vals.map(([v, l]) => `<option value=\"${v}\" ${v === sel ? 'selected' : ''}>${l}</option>`).join('');\n\nconst STYLES = [['casual', 'Casual'], ['chic', 'Chic'], ['business', 'Business'], ['streetwear', 'Streetwear'], ['sport', 'Sport'], ['boheme', 'Bohème']];\nconst OCC = [['quotidien', 'Quotidien'], ['travail', 'Travail'], ['sortie', 'Sortie'], ['rendez-vous', 'Rendez-vous'], ['week-end', 'Week-end'], ['sport', 'Sport'], ['voyage', 'Voyage']];\nconst SIM = [['', 'Météo réelle (Open-Meteo)'], ['pluie_froide', '🌧️ Simuler : pluie froide'], ['canicule', '🔥 Simuler : canicule'],\n  ['neige', '❄️ Simuler : neige'], ['vent_fort', '💨 Simuler : vent fort'], ['printemps', '🌸 Simuler : printemps']];\nconst BAND = { very_cold: '🥶', cold: '❄️', cool: '🍂', mild: '🌤️', warm: '☀️', hot: '🔥' };\n\nconst rows = (d.recent || []).map((r) => `<tr><td>${esc(r.outfit_date)}</td><td>${BAND[r.band] || ''} <b>${esc(r.title)}</b><br><small>${esc((r.items || []).join(' · '))}</small></td>\n  <td>${esc(r.style)}</td><td>${r.mode === 'llm' ? '🤖' : '⚙️'} ${r.score !== null ? Math.round(r.score * 100) + '%' : '–'}</td>\n  <td>${r.rating ? '★'.repeat(r.rating) : [1, 2, 3, 4, 5].map((n) => `<a href=\"${base}outfit-feedback?id=${r.id}&r=${n}\" title=\"${n}/5\">☆</a>`).join('')}</td></tr>`).join('');\nconst laundry = (d.laundry || []).map((i) => `<li>${esc(i.name)} <button onclick=\"clean(${i.id},this)\">Propre ✓</button></li>`).join('');\n\nconst html = `<!doctype html><html lang=\"fr\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>Météo-Dressing</title><style>\n:root{--bg:#f6f4ef;--ink:#1d1b16;--mut:#6b675e;--acc:#2f5d50}\n*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--ink)}\n.wrap{max-width:900px;margin:0 auto;padding:24px 16px 60px}h1{margin:0}header p{color:var(--mut);margin:4px 0 18px}\n.card{background:#fff;border-radius:18px;padding:20px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,.06)}\nform{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:12px}\nlabel{display:flex;flex-direction:column;font-size:.8rem;color:var(--mut);gap:4px}\nselect,input{font:inherit;padding:10px;border:1px solid #ddd;border-radius:10px;background:#fff;color:var(--ink)}\nbutton.go{grid-column:1/-1;font:inherit;font-weight:600;padding:14px;border:0;border-radius:12px;background:var(--acc);color:#fff;cursor:pointer}\n.kpis{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}\n.kpi{background:#f1efe9;border-radius:14px;padding:12px}.kpi b{font-size:1.4rem;display:block}.kpi small{color:var(--mut)}\ntable{width:100%;border-collapse:collapse;font-size:.9rem}td,th{padding:8px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}\ntd small{color:var(--mut)}td a{text-decoration:none;color:#e0a100;font-size:1.1rem}.scroll{overflow-x:auto}\n#load{display:none;text-align:center;padding:30px;font-size:1.1rem}\nul{padding-left:18px}li button{font-size:.75rem;margin-left:6px;border:0;background:#e3f4ea;border-radius:8px;padding:3px 8px;cursor:pointer}\n</style></head><body><div class=\"wrap\">\n<header><h1>👗 Météo-Dressing</h1><p>Ta tenue du jour selon la météo, ton style et ce que tu as déjà porté.</p></header>\n<div class=\"card\" id=\"formcard\"><form id=\"f\">\n  <label>Profil<select name=\"user_id\" onchange=\"location.href='${base}dressing?user_id='+this.value\">${opt(users.map((u) => [String(u.id), `${esc(u.name)} (${esc(u.city)})`]), String(me.id))}</select></label>\n  <label>Ville<input name=\"city\" placeholder=\"${esc(me.city)}\"></label>\n  <label>Style<select name=\"style\">${opt(STYLES, me.style)}</select></label>\n  <label>Occasion<select name=\"occasion\">${opt(OCC, 'quotidien')}</select></label>\n  <label>Pour<select name=\"day_offset\"><option value=\"0\">Aujourd'hui</option><option value=\"1\">Demain</option></select></label>\n  <label>Météo<select name=\"simulate\">${opt(SIM, '')}</select></label>\n  <button class=\"go\" type=\"submit\">✨ Générer ma tenue</button>\n</form></div>\n<div id=\"load\" class=\"card\">🧵 Ton styliste IA consulte la météo et ta garde-robe…</div>\n<div class=\"card\"><b>Qualité du système (tous les runs)</b><div class=\"kpis\" style=\"margin-top:10px\">\n  <div class=\"kpi\"><b>${S.total_runs ?? 0}</b><small>tenues générées</small></div>\n  <div class=\"kpi\"><b>${S.avg_rule_score_pct ?? '–'}%</b><small>score contrôles auto</small></div>\n  <div class=\"kpi\"><b>${S.llm_success_pct ?? '–'}%</b><small>sorties IA utilisables</small></div>\n  <div class=\"kpi\"><b>${S.avg_user_rating ?? '–'}/5</b><small>note moyenne (${S.rated_outfits ?? 0} avis)</small></div>\n  <div class=\"kpi\"><b>${S.avg_latency_ms ?? '–'} ms</b><small>latence moyenne</small></div>\n</div></div>\n<div class=\"card\"><b>7 dernières tenues de ${esc(me.name)}</b><div class=\"scroll\"><table><tr><th>Date</th><th>Tenue</th><th>Style</th><th>Qualité</th><th>Note</th></tr>\n${rows || '<tr><td colspan=\"5\"><i>Aucune tenue pour le moment.</i></td></tr>'}</table></div></div>\n<div class=\"card\"><b>🧺 Au linge sale</b>${laundry ? `<ul>${laundry}</ul>` : '<p style=\"color:var(--mut)\">Rien au sale 🎉</p>'}</div>\n</div>\n<script>\ndocument.getElementById('f').addEventListener('submit', async (e) => {\n  e.preventDefault();\n  const fd = Object.fromEntries(new FormData(e.target));\n  const body = { user_id: Number(fd.user_id), style: fd.style, occasion: fd.occasion, day_offset: Number(fd.day_offset), format: 'html' };\n  if (fd.city.trim()) body.city = fd.city.trim();\n  if (fd.simulate) body.simulate = fd.simulate;\n  document.getElementById('load').style.display = 'block';\n  try {\n    const r = await fetch('${base}outfit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });\n    const html = await r.text(); document.open(); document.write(html); document.close();\n  } catch (err) { document.getElementById('load').textContent = 'Erreur réseau : ' + err.message; }\n});\nasync function clean(id, btn){ btn.disabled = true;\n  const r = await fetch('${base}wardrobe-status', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ item_id:id, status:'available' }) });\n  btn.textContent = r.ok ? 'OK' : 'Erreur'; }\n</script></body></html>`;\n\nreturn { json: { source: 'webhook', content_type: 'text/html; charset=utf-8', status_code: 200, response_body: html } };\n"
+      },
+      "id": "6200c3cb-9f27-4f4a-816b-cae7d527ccd6",
+      "name": "Construire la page de l'appli",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        960
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.response_body }}",
+        "options": {
+          "responseCode": "={{ $json.status_code || 200 }}",
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "={{ $json.content_type }}"
+              },
+              {
+                "name": "Cache-Control",
+                "value": "no-store"
+              }
+            ]
+          }
+        }
+      },
+      "id": "8bb18f49-1c9a-44d8-9b3f-f9c8e9e135f9",
+      "name": "Répondre (appli)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        688,
+        960
+      ]
+    },
+    {
+      "parameters": {
+        "path": "outfit-feedback",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "5c5bb1ba-cc75-4d67-a516-ad645bf16d8b",
+      "name": "Feedback (GET /outfit-feedback)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        32,
+        1152
+      ],
+      "webhookId": "685c8b95-4cec-47c5-ad3e-92aedb124f8b"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "select $1::jsonb as q, rate_outfit(($1::jsonb->>'id')::bigint, ($1::jsonb->>'r')::int) as res;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ id: parseInt($json.query.id) || 0, r: parseInt($json.query.r) || 0, base_url: String($json.webhookUrl || '').replace(/[^/]*$/, '') }) }}"
+        }
+      },
+      "id": "577ddd7b-6436-4b7c-8158-a2be8cf798ef",
+      "name": "Enregistrer la note",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        256,
+        1152
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500,
+      "credentials": {
+        "postgres": {
+          "id": "DEQMY1kXFjEh0BNk",
+          "name": "Postgres account 3"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ============================================================\n// Nœud : \"Construire la page merci\"   (Mode : Run Once for Each Item)\n// Après un clic sur une étoile : la note est enregistrée (rate_outfit)\n// et sert à la fois d'évaluation humaine ET d'apprentissage des goûts.\n// ============================================================\nconst res = $json.res || {};\nconst q = $json.q || {};\nconst base = q.base_url || '';\nconst ok = res.ok === true;\nconst html = `<!doctype html><html lang=\"fr\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>Merci · Météo-Dressing</title><style>body{font-family:system-ui,sans-serif;background:#f6f4ef;display:grid;place-items:center;min-height:100vh;margin:0}\n.c{background:#fff;padding:28px;border-radius:18px;max-width:420px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,.08)}a{color:#2f5d50}</style></head>\n<body><div class=\"c\"><div style=\"font-size:2.4rem\">${ok ? '⭐'.repeat(res.rating) : '⚠️'}</div>\n<h2>${ok ? 'Merci pour ta note !' : 'Note non enregistrée'}</h2>\n<p>${ok ? 'Les prochaines suggestions tiendront compte de ton avis.' : String(res.error || 'Paramètres invalides').replace(/</g, '&lt;')}</p>\n<p><a href=\"${base}dressing\">← Retour au dressing</a></p></div></body></html>`;\nreturn { json: { source: 'webhook', content_type: 'text/html; charset=utf-8', status_code: ok ? 200 : 400, response_body: html } };\n"
+      },
+      "id": "b26a1357-86c4-45c3-84b5-bab984805d0c",
+      "name": "Construire la page merci",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        1152
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.response_body }}",
+        "options": {
+          "responseCode": "={{ $json.status_code || 200 }}",
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "={{ $json.content_type }}"
+              },
+              {
+                "name": "Cache-Control",
+                "value": "no-store"
+              }
+            ]
+          }
+        }
+      },
+      "id": "6794164f-2f9d-4b31-947a-2d24e6cffe24",
+      "name": "Répondre (feedback)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        688,
+        1152
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "wardrobe-status",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "69890853-1fdf-4f0f-addc-1c1926a2c396",
+      "name": "Statut pièce (POST /wardrobe-status)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        32,
+        1360
+      ],
+      "webhookId": "863cc520-556b-4532-a436-f65787c86ed9"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "select set_item_status(($1::jsonb->>'item_id')::int, $1::jsonb->>'status') as res;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ item_id: parseInt(($json.body || {}).item_id) || 0, status: ['available','laundry','retired'].includes(($json.body || {}).status) ? $json.body.status : 'available' }) }}"
+        }
+      },
+      "id": "faa55bb4-7dbb-4964-b8e8-2e30100a8534",
+      "name": "Mettre à jour la pièce",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        256,
+        1360
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500,
+      "credentials": {
+        "postgres": {
+          "id": "DEQMY1kXFjEh0BNk",
+          "name": "Postgres account 3"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ============================================================\n// Nœud : \"Réponse statut pièce\"   (Mode : Run Once for Each Item)\n// ============================================================\nconst res = $json.res;\nreturn { json: { source: 'webhook', content_type: 'application/json; charset=utf-8',\n  status_code: res ? 200 : 404,\n  response_body: JSON.stringify(res ? { ok: true, item: res } : { ok: false, error: 'Pièce introuvable' }) } };\n"
+      },
+      "id": "bb35767c-adef-4504-a470-c816b5eabf46",
+      "name": "Réponse statut pièce",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        1360
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.response_body }}",
+        "options": {
+          "responseCode": "={{ $json.status_code || 200 }}",
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "={{ $json.content_type }}"
+              },
+              {
+                "name": "Cache-Control",
+                "value": "no-store"
+              }
+            ]
+          }
+        }
+      },
+      "id": "b709366d-f21f-40b6-a1b9-7b2768b2ee84",
+      "name": "Répondre (statut)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        688,
+        1360
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://litellm.jedha.co/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.llm_request) }}",
+        "options": {
+          "timeout": 90000
+        }
+      },
+      "id": "4557a30c-0811-4d52-a848-4c39c5f559ab",
+      "name": "OpenAI request",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2240,
+        288
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "BYNG2wZgrkovm757",
+          "name": "OpenAI_API"
+        }
+      },
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Chaque jour à 7h": {
+      "main": [
+        [
+          {
+            "node": "Utilisateurs actifs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Utilisateurs actifs": {
+      "main": [
+        [
+          {
+            "node": "Normaliser la requête",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook tenue (POST /outfit)": {
+      "main": [
+        [
+          {
+            "node": "Normaliser la requête",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normaliser la requête": {
+      "main": [
+        [
+          {
+            "node": "Charger profil & garde-robe",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Charger profil & garde-robe": {
+      "main": [
+        [
+          {
+            "node": "Géocoder la ville (Open-Meteo)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Géocoder la ville (Open-Meteo)": {
+      "main": [
+        [
+          {
+            "node": "Résoudre la localisation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Résoudre la localisation": {
+      "main": [
+        [
+          {
+            "node": "Prévisions météo (Open-Meteo)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prévisions météo (Open-Meteo)": {
+      "main": [
+        [
+          {
+            "node": "Analyser la météo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Analyser la météo": {
+      "main": [
+        [
+          {
+            "node": "Contexte valide ?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pré-filtrer & construire le prompt": {
+      "main": [
+        [
+          {
+            "node": "OpenAI request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Valider & évaluer la tenue": {
+      "main": [
+        [
+          {
+            "node": "Enregistrer la tenue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Enregistrer la tenue": {
+      "main": [
+        [
+          {
+            "node": "Construire la réponse",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Construire la réponse": {
+      "main": [
+        [
+          {
+            "node": "Déclenché par webhook ?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Construire la réponse d'erreur": {
+      "main": [
+        [
+          {
+            "node": "Déclenché par webhook ?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Contexte valide ?": {
+      "main": [
+        [
+          {
+            "node": "Pré-filtrer & construire le prompt",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Construire la réponse d'erreur",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Déclenché par webhook ?": {
+      "main": [
+        [
+          {
+            "node": "Répondre",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Fin (run planifié)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Page appli (GET /dressing)": {
+      "main": [
+        [
+          {
+            "node": "Données de l'appli",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Données de l'appli": {
+      "main": [
+        [
+          {
+            "node": "Construire la page de l'appli",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Construire la page de l'appli": {
+      "main": [
+        [
+          {
+            "node": "Répondre (appli)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Feedback (GET /outfit-feedback)": {
+      "main": [
+        [
+          {
+            "node": "Enregistrer la note",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Enregistrer la note": {
+      "main": [
+        [
+          {
+            "node": "Construire la page merci",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Construire la page merci": {
+      "main": [
+        [
+          {
+            "node": "Répondre (feedback)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Statut pièce (POST /wardrobe-status)": {
+      "main": [
+        [
+          {
+            "node": "Mettre à jour la pièce",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mettre à jour la pièce": {
+      "main": [
+        [
+          {
+            "node": "Réponse statut pièce",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Réponse statut pièce": {
+      "main": [
+        [
+          {
+            "node": "Répondre (statut)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI request": {
+      "main": [
+        [
+          {
+            "node": "Valider & évaluer la tenue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "29e25602-ed60-4db5-8749-f449c6aeaa35",
+  "meta": {
+    "instanceId": "644cb2fadaf799142cabedc804be74ca15a60aa2cb7fb443c746a73e415e7dbe"
+  },
+  "nodeGroups": [],
+  "id": "utXcvoZxTAuF2ePx",
+  "tags": []
+}
