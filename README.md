@@ -9,7 +9,7 @@ Un pipeline qui consulte la météo, lit ta garde-robe en base de données et de
 | Exigence | Implémentation |
 |---|---|
 | Source de données externe | **Open-Meteo** (géocodage + prévisions horaires, gratuit, sans clé) + dataset garde-robe (78 pièces) |
-| Étape LLM | **NVIDIA NIM** `meta/llama-3.3-70b-instruct`, prompt système + prompt utilisateur, sortie JSON |
+| Étape LLM | **OPENAI API** prompt système + prompt utilisateur, sortie JSON |
 | Automatisation n8n | Schedule 7h + 4 webhooks, 34 nœuds, retry, Error Trigger |
 | Stockage BDD | **PostgreSQL (Supabase)** : `app_users`, `wardrobe_items`, `outfit_history`, `pipeline_errors` |
 | Évaluation chiffrée | 8 contrôles auto par run, accuracy sur 30 scénarios annotés, répétitions sur 14 jours, grille humaine 1-5, notes utilisateurs |
@@ -109,13 +109,6 @@ select * from pipeline_errors order by id desc;
 
 Les scénarios dans `eval/scenarios.json` ont été annotés à l'avance : **relisez-les** et ajustez les étiquettes si vous n'êtes pas d'accord — c'est votre jeu de référence.
 
-## Démo (10 min)
-
-1. **Architecture (2 min)** : `docs/architecture.png`.
-2. **Live (5 min)** : ouvrir `/webhook/dressing` → générer une tenue réelle → la noter ★ → régénérer (pièces différentes) → simulation « neige » puis « canicule » → montrer l'exécution dans n8n → `select * from outfit_history order by id desc limit 5;`
-3. **Évaluation (3 min)** : `report.md` + `v_eval_summary`, puis les limites (voir ci-dessous).
-
-Répétez deux fois. Prévoyez une capture vidéo en secours si le Wi-Fi ou l'API tombent — le repli déterministe garantit malgré tout une réponse.
 
 ## Tests hors-ligne
 
@@ -129,16 +122,6 @@ node tests/sequence_test.js    # 14 jours → 0 répétition
 
 Après modification d'un fichier `n8n/code/*.js` : `python n8n/build_workflow.py` puis ré-importer.
 
-## Dépannage
-
-| Symptôme | Piste |
-|---|---|
-| Erreur sur un nœud Postgres (`invalid input syntax for type json`, mauvais nombre de paramètres) | Vérifier que le nœud est en version 2.5+. Sinon, dans *Options → Query Parameters*, remplacer par `{{ [ JSON.stringify($json) ] }}` (forme tableau). |
-| `401` sur le nœud NVIDIA | Credential Header Auth : la valeur doit être `Bearer nvapi-...` (avec « Bearer »). |
-| `404` / modèle introuvable | Le catalogue change : copier l'identifiant exact depuis build.nvidia.com et le mettre dans `MODEL_DEFAULT` (`04_preparer_prompt.js`) ou passer `"model"` dans la requête. |
-| Toujours « algorithme de secours » | Ouvrir l'exécution, regarder la sortie du nœud LLM ; `llm_raw` est aussi stocké dans `outfit_history`. |
-| La page reste en chargement | Le workflow n'est pas actif ou le chemin webhook est pris par un autre workflow. |
-| Connexion Supabase refusée | Utiliser le *Session pooler* (IPv4), pas la connexion directe. |
 
 ## Limites et pistes d'amélioration
 
